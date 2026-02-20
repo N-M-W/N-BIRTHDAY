@@ -1,103 +1,59 @@
-import initSqlJs, { Database as SqlJsDatabase } from "sql.js";
 import path from "path";
 import fs from "fs";
 
-const DB_PATH = path.join(process.cwd(), "data", "gifts.db");
+// On Vercel serverless, the project root is read-only; use /tmp for persistence
+// within the same function instance. Locally, use data/ in the project root.
+const isVercel = !!process.env.VERCEL;
+const DATA_DIR = isVercel ? "/tmp" : path.join(process.cwd(), "data");
+const CLAIMS_FILE = path.join(DATA_DIR, "claims.json");
 
-let db: SqlJsDatabase | null = null;
-let sqlReady: Promise<void> | null = null;
+type ClaimsMap = Record<string, string>;
 
-function saveDb() {
-  if (db) {
-    const dir = path.dirname(DB_PATH);
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
+function readClaims(): ClaimsMap {
+  try {
+    if (fs.existsSync(CLAIMS_FILE)) {
+      const raw = fs.readFileSync(CLAIMS_FILE, "utf-8");
+      return JSON.parse(raw) as ClaimsMap;
     }
-    const data = db.export();
-    fs.writeFileSync(DB_PATH, Buffer.from(data));
+  } catch {
+    // If the file is corrupt, start fresh
   }
+  return {};
 }
 
-async function initDb(): Promise<SqlJsDatabase> {
-  if (db) return db;
-
-  const wasmPath = path.join(
-    process.cwd(),
-    "node_modules",
-    "sql.js",
-    "dist",
-    "sql-wasm.wasm"
-  );
-  const wasmBinary = fs.readFileSync(wasmPath);
-  const SQL = await initSqlJs({ wasmBinary });
-
-  const dir = path.dirname(DB_PATH);
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
+function writeClaims(claims: ClaimsMap): void {
+  if (!fs.existsSync(DATA_DIR)) {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
   }
-
-  if (fs.existsSync(DB_PATH)) {
-    const fileBuffer = fs.readFileSync(DB_PATH);
-    db = new SQL.Database(fileBuffer);
-  } else {
-    db = new SQL.Database();
-  }
-
-  // Create table if not exists
-  db.run(`
-    CREATE TABLE IF NOT EXISTS claims (
-      gift_id TEXT PRIMARY KEY,
-      claimed_by TEXT NOT NULL,
-      claimed_at TEXT DEFAULT (datetime('now'))
-    )
-  `);
-  saveDb();
-
-  return db;
-}
-
-function getDbReady(): Promise<SqlJsDatabase> {
-  if (!sqlReady) {
-    sqlReady = initDb().then(() => {});
-  }
-  return sqlReady.then(() => db!);
+  fs.writeFileSync(CLAIMS_FILE, JSON.stringify(claims, null, 2), "utf-8");
 }
 
 export interface ClaimRow {
   gift_id: string;
   claimed_by: string;
-  claimed_at: string;
 }
 
-export async function getAllClaims(): Promise<Record<string, string>> {
-  const db = await getDbReady();
-  const results = db.exec("SELECT gift_id, claimed_by FROM claims");
-  const claims: Record<string, string> = {};
-  if (results.length > 0) {
-    for (const row of results[0].values) {
-      claims[row[0] as string] = row[1] as string;
-    }
-  }
-  return claims;
+export async function getAllClaims(): Promise<ClaimsMap> {
+  return readClaims();
 }
 
 export async function claimGift(giftId: string, name: string): Promise<boolean> {
-  const db = await getDbReady();
-  try {
-    db.run("INSERT INTO claims (gift_id, claimed_by) VALUES (?, ?)", [giftId, name]);
-    saveDb();
-    return true;
-  } catch {
-    // Already claimed (PRIMARY KEY conflict)
+  const claims = readClaims();
+  if (claims[giftId]) {
+    // Already claimed
     return false;
   }
+  claims[giftId] = name;
+  writeClaims(claims);
+  return true;
 }
 
 export async function unclaimGift(giftId: string): Promise<boolean> {
-  const db = await getDbReady();
-  const before = db.getRowsModified();
-  db.run("DELETE FROM claims WHERE gift_id = ?", [giftId]);
-  const after = db.getRowsModified();
-  saveDb();
-  return after > 0;
+  const claims = readClaims();
+  if (!claims[giftId]) {
+    return false;
+  }
+  delete claims[giftId];
+  writeClaims(claims);
+  return true;
 }
